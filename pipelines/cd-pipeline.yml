@@ -1,0 +1,161 @@
+# ==============================================================================
+# Azure DevOps CD Pipeline (Continuous Deployment & Release Management)
+# ==============================================================================
+# Purpose:
+#   - Deploys Terraform Landing Zones & Workloads into target cloud environments.
+#   - Runtime dropdown parameter allows selecting target: 'dev', 'qa', or 'prod'.
+#   - Runtime toggle parameters to select WHICH DevSecOps/FinOps scanning tools to run!
+#   - Enforces Manual Approval & Reviewer Notifications via ADO Environments.
+#   - Applies verified binary plan artifact (tfplan) to eliminate drift.
+# ==============================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-cd-${{ parameters.environment }}-deploy
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - environments/**
+      - modules/**
+      - pipelines/**
+
+pr: none # Pull requests are handled strictly by ci-pipeline.yml
+
+# ------------------------------------------------------------------------------
+# Runtime Deployment Parameters (Interactive Dropdowns & Toggles in ADO Portal)
+# ------------------------------------------------------------------------------
+parameters:
+  - name: environment
+    displayName: '🎯 Select Target Environment'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - qa
+      - prod
+
+  - name: deploymentAction
+    displayName: '⚙️ Deployment Action'
+    type: string
+    default: 'PlanAndApply'
+    values:
+      - PlanAndApply
+      - PlanOnly
+
+  # ----------------------------------------------------------------------------
+  # Granular Security & Compliance Scanning Options (User Selectable)
+  # ----------------------------------------------------------------------------
+  - name: enableGitleaks
+    displayName: '🔑 Run Gitleaks (Secret & Token Leak Scanner)'
+    type: boolean
+    default: true
+
+  - name: enableTflint
+    displayName: '🧹 Run TFLint (Terraform Syntax & Provider Linter)'
+    type: boolean
+    default: true
+
+  - name: enableCheckov
+    displayName: '🛡️ Run Checkov (CIS Benchmarks & Security Compliance)'
+    type: boolean
+    default: true
+
+  - name: enableTrivy
+    displayName: '🔎 Run Trivy (IaC Misconfiguration Scanner)'
+    type: boolean
+    default: true
+
+  - name: enableInfracost
+    displayName: '💰 Run Infracost (Monthly Cloud Cost Estimation)'
+    type: boolean
+    default: true
+
+  - name: approverEmails
+    displayName: '📧 Approver Email(s) for Manual Validation'
+    type: string
+    default: 'upsy0910@gmail.com'
+
+  - name: terraformVersion
+    displayName: '🔧 Terraform Engine Version'
+    type: string
+    default: '1.9.5'
+
+variables:
+  - name: workingDirectory
+    value: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.environment }}'
+  - name: azureServiceConnection
+    value: 'sc-azure-terraform-${{ parameters.environment }}'
+  - name: backendResourceGroup
+    value: 'rg-enterprise-${{ parameters.environment }}-mgmt-eastus2'
+  - name: backendStorageAccount
+    value: 'stoneaimtfstatedev'
+  - name: backendContainer
+    value: 'tfstate'
+  - name: backendKey
+    value: '${{ parameters.environment }}.terraform.tfstate'
+  - name: adoEnvironment
+    value: 'azure-infrastructure-${{ parameters.environment }}'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+
+stages:
+  # ============================================================================
+  # Stage 1: Pre-Flight DevSecOps Quality & Security SAST Scan
+  # ============================================================================
+  - template: templates/stage-security-lint.yml
+    parameters:
+      stageName: 'CDPreflightSecurity'
+      displayName: '🛡️ Pre-Flight Security & Quality Audit'
+      workingDirectory: $(workingDirectory)
+      terraformVersion: ${{ parameters.terraformVersion }}
+      vmImageName: $(vmImageName)
+      enableGitleaks: ${{ parameters.enableGitleaks }}
+      enableTflint: ${{ parameters.enableTflint }}
+      enableCheckov: ${{ parameters.enableCheckov }}
+      enableTrivy: ${{ parameters.enableTrivy }}
+      enableFmtCheck: true
+      enableValidate: true
+
+  # ============================================================================
+  # Stage 2: Terraform Plan Generation & Cost Estimation
+  # ============================================================================
+  - template: templates/stage-terraform-plan.yml
+    parameters:
+      stageName: 'CDTerraformPlan'
+      displayName: '📋 Generate Deployment Plan (${{ parameters.environment }})'
+      dependsOn: ['CDPreflightSecurity']
+      condition: succeeded()
+      workingDirectory: $(workingDirectory)
+      environment: ${{ parameters.environment }}
+      azureServiceConnection: $(azureServiceConnection)
+      backendResourceGroup: $(backendResourceGroup)
+      backendStorageAccount: $(backendStorageAccount)
+      backendContainer: $(backendContainer)
+      backendKey: $(backendKey)
+      terraformVersion: ${{ parameters.terraformVersion }}
+      vmImageName: $(vmImageName)
+      enableInfracost: ${{ parameters.enableInfracost }}
+
+  # ============================================================================
+  # Stage 3: Manual Validation Gate & Terraform Apply
+  # ============================================================================
+  - template: templates/stage-terraform-apply.yml
+    parameters:
+      stageName: 'CDTerraformApply'
+      displayName: '🚀 Manual Approval & Deploy (${{ parameters.environment }})'
+      dependsOn: ['CDTerraformPlan']
+      condition: and(succeeded(), eq('${{ parameters.deploymentAction }}', 'PlanAndApply'))
+      workingDirectory: $(workingDirectory)
+      environment: ${{ parameters.environment }}
+      adoEnvironment: $(adoEnvironment)
+      azureServiceConnection: $(azureServiceConnection)
+      backendResourceGroup: $(backendResourceGroup)
+      backendStorageAccount: $(backendStorageAccount)
+      backendContainer: $(backendContainer)
+      backendKey: $(backendKey)
+      requireManualValidation: true
+      notifyUsers: ${{ parameters.approverEmails }}
+      terraformVersion: ${{ parameters.terraformVersion }}
+      vmImageName: $(vmImageName)

@@ -1,0 +1,124 @@
+# ==============================================================================
+# Azure DevOps CI Pipeline (Continuous Integration & Pull Request Validation)
+# ==============================================================================
+# Purpose:
+#   - Validates all code changes when a Pull Request is opened or updated.
+#   - Runs 100% Free DevSecOps Suite (Gitleaks, TFLint, Checkov, Trivy, Infracost).
+#   - Granular tool options allow enabling/disabling specific scanners.
+#   - Generates speculative Terraform Plan & Infracost Monthly Cost Analysis.
+#   - Posts rich Markdown summary for PR reviewers.
+#   - Guarantees 0% accidental deployment (Apply stage is excluded in CI).
+# ==============================================================================
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-ci-pr-$(Build.SourceBranchName)
+
+trigger: none # CI is triggered strictly on Pull Requests & Feature commits
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+      - release/*
+  paths:
+    include:
+      - environments/**
+      - modules/**
+      - pipelines/**
+
+parameters:
+  - name: testEnvironment
+    displayName: '🎯 Validate Against Environment'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - qa
+      - prod
+
+  # ----------------------------------------------------------------------------
+  # Granular Security & Compliance Scanning Options (User Selectable)
+  # ----------------------------------------------------------------------------
+  - name: enableGitleaks
+    displayName: '🔑 Run Gitleaks (Secret & Token Leak Scanner)'
+    type: boolean
+    default: true
+
+  - name: enableTflint
+    displayName: '🧹 Run TFLint (Terraform Syntax & Provider Linter)'
+    type: boolean
+    default: true
+
+  - name: enableCheckov
+    displayName: '🛡️ Run Checkov (CIS Benchmarks & Security Compliance)'
+    type: boolean
+    default: true
+
+  - name: enableTrivy
+    displayName: '🔎 Run Trivy (IaC Misconfiguration Scanner)'
+    type: boolean
+    default: true
+
+  - name: enableInfracost
+    displayName: '💰 Run Infracost (Monthly Cloud Cost Estimation)'
+    type: boolean
+    default: true
+
+  - name: terraformVersion
+    displayName: '🔧 Terraform Engine Version'
+    type: string
+    default: '1.9.5'
+
+variables:
+  - name: workingDirectory
+    value: '$(System.DefaultWorkingDirectory)/environments/${{ parameters.testEnvironment }}'
+  - name: azureServiceConnection
+    value: 'sc-azure-terraform-${{ parameters.testEnvironment }}'
+  - name: backendResourceGroup
+    value: 'rg-enterprise-${{ parameters.testEnvironment }}-mgmt-eastus2'
+  - name: backendStorageAccount
+    value: 'stoneaimtfstatedev'
+  - name: backendContainer
+    value: 'tfstate'
+  - name: backendKey
+    value: '${{ parameters.testEnvironment }}.terraform.tfstate'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+
+stages:
+  # ============================================================================
+  # Stage 1: DevSecOps Quality & Security SAST Analysis
+  # ============================================================================
+  - template: templates/stage-security-lint.yml
+    parameters:
+      stageName: 'CISecurityAndQuality'
+      displayName: '🛡️ CI Security, Lint & Compliance Scans'
+      workingDirectory: $(workingDirectory)
+      terraformVersion: ${{ parameters.terraformVersion }}
+      vmImageName: $(vmImageName)
+      enableGitleaks: ${{ parameters.enableGitleaks }}
+      enableTflint: ${{ parameters.enableTflint }}
+      enableCheckov: ${{ parameters.enableCheckov }}
+      enableTrivy: ${{ parameters.enableTrivy }}
+      enableFmtCheck: true
+      enableValidate: true
+
+  # ============================================================================
+  # Stage 2: Speculative Terraform Execution Plan & FinOps Infracost Check
+  # ============================================================================
+  - template: templates/stage-terraform-plan.yml
+    parameters:
+      stageName: 'CITerraformPlan'
+      displayName: '📋 CI Speculative Plan & Cost Estimation'
+      dependsOn: ['CISecurityAndQuality']
+      condition: succeeded()
+      workingDirectory: $(workingDirectory)
+      environment: ${{ parameters.testEnvironment }}
+      azureServiceConnection: $(azureServiceConnection)
+      backendResourceGroup: $(backendResourceGroup)
+      backendStorageAccount: $(backendStorageAccount)
+      backendContainer: $(backendContainer)
+      backendKey: $(backendKey)
+      terraformVersion: ${{ parameters.terraformVersion }}
+      vmImageName: $(vmImageName)
+      enableInfracost: ${{ parameters.enableInfracost }}

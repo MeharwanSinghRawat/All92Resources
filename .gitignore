@@ -1,0 +1,48 @@
+# ==============================================================================
+# Terraform Git Ignore Rules for Azure DevOps & Enterprise Repos
+# ==============================================================================
+
+# Local .terraform directories
+**/.terraform/
+.terraform/
+
+# Terraform State files
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform.tfstate.lock.info
+
+# Terraform Plan execution files
+*.tfplan
+tfplan
+
+# Crash & debug logs
+crash.log
+crash.*.log
+*.log
+
+# Sensitive tfvars & secrets
+*.tfvars.secret
+*.auto.tfvars.secret
+secrets.tfvars
+terraform.tfvars.json
+
+# Local overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db

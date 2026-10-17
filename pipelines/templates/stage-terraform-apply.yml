@@ -1,0 +1,159 @@
+# ==============================================================================
+# Stage Template: Manual Approval-Gated Terraform Apply
+# Target: Azure Infrastructure Deployment via Azure DevOps Environments & ManualValidation
+# ==============================================================================
+
+parameters:
+  - name: stageName
+    type: string
+    default: 'TerraformApply'
+  - name: displayName
+    type: string
+    default: 'Manual Validation & Terraform Apply'
+  - name: dependsOn
+    type: object
+    default: ['TerraformPlan']
+  - name: condition
+    type: string
+    default: "and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))"
+  - name: workingDirectory
+    type: string
+  - name: environment
+    type: string
+  - name: adoEnvironment
+    type: string
+    default: ''
+  - name: azureServiceConnection
+    type: string
+  - name: backendResourceGroup
+    type: string
+  - name: backendStorageAccount
+    type: string
+  - name: backendContainer
+    type: string
+  - name: backendKey
+    type: string
+  - name: requireManualValidation
+    type: boolean
+    default: true
+  - name: notifyUsers
+    type: string
+    default: ''
+  - name: terraformVersion
+    type: string
+    default: '1.9.5'
+  - name: vmImageName
+    type: string
+    default: 'ubuntu-latest'
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      # ========================================================================
+      # Job 1: Manual Validation Approval Gate (Agentless Server Job)
+      # ========================================================================
+      - job: ManualValidationGate
+        displayName: '✋ Manual Validation Approval Gate'
+        condition: and(succeeded(), eq('${{ parameters.requireManualValidation }}', 'true'))
+        pool: server
+        timeoutInMinutes: 1440 # 24 hours approval window
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: |
+                ${{ parameters.notifyUsers }}
+              instructions: |
+                ⚠️ MANUAL APPROVAL REQUIRED BEFORE APPLY:
+                - Target Environment: ${{ parameters.environment }}
+                - Trigger: Pull Request merged into main branch
+                - Please inspect the generated Plan artifact (tfplan) and Infracost summary.
+                - Click "Resume" to approve and apply changes to Azure.
+                - Click "Reject" to cancel deployment.
+              onTimeout: 'reject'
+
+      # ========================================================================
+      # Job 2: Terraform Apply Deployment
+      # Runs after manual validation is approved (or immediately if validation disabled)
+      # ========================================================================
+      - deployment: ApplyInfrastructure
+        displayName: '🚀 Execute Terraform Apply (${{ parameters.environment }})'
+        dependsOn: ManualValidationGate
+        condition: succeeded()
+        pool:
+          vmImage: ${{ parameters.vmImageName }}
+        environment: 'azure-infrastructure-${{ parameters.environment }}'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  displayName: 'Checkout Repository Code'
+
+                # Download the validated execution plan artifact generated in the Plan stage
+                - task: DownloadPipelineArtifact@2
+                  displayName: 'Download Validated Plan Artifact (tfplan)'
+                  inputs:
+                    buildType: 'current'
+                    artifactName: 'terraform-plan-${{ parameters.environment }}'
+                    targetPath: '$(Pipeline.Workspace)/plan-artifact'
+
+                # Install Terraform runtime
+                - task: TerraformInstaller@1
+                  displayName: 'Install Terraform ${{ parameters.terraformVersion }}'
+                  inputs:
+                    terraformVersion: '${{ parameters.terraformVersion }}'
+
+                # --------------------------------------------------------------------
+                # 1. Terraform Init (Service Principal Authentication via backendServiceArm)
+                # --------------------------------------------------------------------
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Init (${{ parameters.environment }})'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'init'
+                    workingDirectory: ${{ parameters.workingDirectory }}
+                    backendServiceArm: ${{ parameters.azureServiceConnection }}
+                    backendAzureRmResourceGroupName: ${{ parameters.backendResourceGroup }}
+                    backendAzureRmStorageAccountName: ${{ parameters.backendStorageAccount }}
+                    backendAzureRmContainerName: ${{ parameters.backendContainer }}
+                    backendAzureRmKey: ${{ parameters.backendKey }}
+
+                # --------------------------------------------------------------------
+                # 2. Terraform Apply (Service Principal Authentication via environmentServiceNameAzureRM)
+                # --------------------------------------------------------------------
+                - task: TerraformTaskV4@4
+                  displayName: 'Terraform Apply (${{ parameters.environment }})'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'apply'
+                    workingDirectory: ${{ parameters.workingDirectory }}
+                    environmentServiceNameAzureRM: ${{ parameters.azureServiceConnection }}
+                    commandOptions: '$(Pipeline.Workspace)/plan-artifact/tfplan'
+
+                # --------------------------------------------------------------------
+                # 3. Publish Deployment Record Summary
+                # --------------------------------------------------------------------
+                - task: Bash@3
+                  displayName: 'Publish Deployment Record Summary'
+                  inputs:
+                    targetType: 'inline'
+                    script: |
+                      DEPLOY_SUMMARY="$(Agent.TempDirectory)/deployment-summary.md"
+                      cat << 'EOF' > "$DEPLOY_SUMMARY"
+                      # 🎉 Terraform Deployment Succeeded!
+
+                      ### Target Environment: **${{ parameters.environment }}**
+                      - **Status:** Applied Successfully
+                      - **Approved By:** $(Build.RequestedFor)
+                      - **Commit:** $(Build.SourceVersion)
+                      - **Branch:** $(Build.SourceBranchName)
+                      - **Timestamp:** $(Build.StartTime)
+
+                      All cloud resources for environment **${{ parameters.environment }}** have converged to desired state.
+                      EOF
+
+                      echo "##vso[task.uploadsummary]$DEPLOY_SUMMARY"

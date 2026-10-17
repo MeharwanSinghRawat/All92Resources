@@ -1,0 +1,1272 @@
+# ==============================================================================
+# ENTERPRISE AZURE TERRAFORM - COMPREHENSIVE CONFIGURATION GUIDE & DEMO TFVARS
+# ==============================================================================
+# File: terraform.tfvars.example
+# Target Environment: Development / QA / Production
+#
+# ------------------------------------------------------------------------------
+# HOW TO USE THIS FILE (USER INSTRUCTIONS / KAISE USE KAREIN):
+# ------------------------------------------------------------------------------
+# 1. Naya environment setup karne ke liye is file ko copy karein:
+#      cp terraform.tfvars.example terraform.tfvars
+#
+# 2. CROSS-MODULE REFERENCE SYSTEM (Most Important Concept):
+#    - Ye framework "Decoupled Key Referencing" use karta hai.
+#    - Aapko raw Azure IDs (jaise /subscriptions/.../resourceGroups/...) hardcode
+#      karne ki zaroorat nahi hoti.
+#    - Bas map keys use karein:
+#        * `resource_group_key = "app"` ➔ automatically targets `resource_groups["app"]`
+#        * `vnet_key = "spoke"`        ➔ automatically targets `virtual_networks["spoke"]`
+#        * `subnet_key = "data"`       ➔ automatically targets `subnets["data"]`
+#        * `identity_key = "app_id"`   ➔ automatically targets `user_assigned_identities["app_id"]`
+#        * `public_ip_key = "appgw"`   ➔ automatically targets `public_ips["appgw"]`
+#
+# 3. HOW TO ENABLE / DISABLE MODULES:
+#    - Kisi bhi module ko disable rakhne ke liye simply empty map de dein:
+#        azure_firewalls = {}
+#    - Enable karne ke liye sample block me apni requirement ke hisab se values fill karein.
+#
+# 4. TESTING YOUR CHANGES:
+#    - Run: terraform fmt
+#    - Run: terraform validate
+#    - Run: terraform plan
+# ==============================================================================
+
+# ==============================================================================
+# 1. CORE ENVIRONMENT PARAMETERS
+# ==============================================================================
+environment  = "dev"          # Options: dev, qa, stage, prod
+project_name = "enterprise"   # Workload / Organization prefix
+location     = "eastus2"      # Azure Region (e.g. eastus2, westeurope, centralindia)
+
+# Global Baseline Tags: Sabhi resources par automatically merge hokar apply honge.
+common_tags = {
+  ManagedBy   = "Terraform"
+  Project     = "EnterprisePlatform"
+  Owner       = "PlatformEngineering"
+  CostCenter  = "IT-102"
+  Compliance  = "PCI-DSS-Tier3"
+}
+
+# ==============================================================================
+# 2. RESOURCE GROUPS
+# ==============================================================================
+# Key ko downstream modules me `resource_group_key` ki tarah refer kiya jata hai.
+# Lock levels: "CanNotDelete", "ReadOnly", ya null (no lock).
+resource_groups = {
+  network = {
+    name       = "rg-enterprise-dev-network-eastus2"
+    location   = "eastus2"
+    lock_level = "CanNotDelete" # Prevents accidental deletion of network backbone
+    tags = {
+      Tier = "Networking"
+    }
+  }
+  data = {
+    name       = "rg-enterprise-dev-data-eastus2"
+    location   = "eastus2"
+    lock_level = "CanNotDelete"
+    tags = {
+      Tier = "Database"
+    }
+  }
+  app = {
+    name       = "rg-enterprise-dev-app-eastus2"
+    location   = "eastus2"
+    lock_level = null
+    tags = {
+      Tier = "Application"
+    }
+  }
+}
+
+# ==============================================================================
+# 3. VIRTUAL NETWORKS & SUBNETS (Hub-and-Spoke Topology)
+# ==============================================================================
+# Instruction:
+# - Hub VNet: Gateway, Firewall, Bastion, Management subnets rakhe.
+# - Spoke VNet: App, Data, Web subnets rakhe.
+# - Subnet me delegations add ki ja sakti hain (e.g. for PostgreSQL).
+virtual_networks = {
+  hub = {
+    name               = "vnet-enterprise-dev-hub-eastus2"
+    resource_group_key = "network"
+    address_space      = ["10.10.0.0/16"]
+    dns_servers        = [] # Empty = Azure Default DNS; ya custom AD DNS IP de sakte hain
+    subnets = {
+      gateway = {
+        name             = "GatewaySubnet" # Fixed Azure reserved name
+        address_prefixes = ["10.10.0.0/24"]
+      }
+      firewall = {
+        name             = "AzureFirewallSubnet" # Fixed Azure reserved name
+        address_prefixes = ["10.10.1.0/24"]
+      }
+      management = {
+        name              = "snet-mgmt"
+        address_prefixes  = ["10.10.2.0/24"]
+        service_endpoints = ["Microsoft.Storage", "Microsoft.KeyVault"]
+      }
+      appgw = {
+        name             = "snet-appgw"
+        address_prefixes = ["10.10.3.0/24"]
+      }
+      bastion = {
+        name             = "AzureBastionSubnet" # Fixed Azure reserved name (min /26 prefix)
+        address_prefixes = ["10.10.4.0/26"]
+      }
+    }
+    tags = {
+      Topology = "Hub"
+    }
+  }
+  spoke = {
+    name               = "vnet-enterprise-dev-spoke-eastus2"
+    resource_group_key = "network"
+    address_space      = ["10.20.0.0/16"]
+    subnets = {
+      web = {
+        name              = "snet-web"
+        address_prefixes  = ["10.20.1.0/24"]
+        service_endpoints = ["Microsoft.Storage"]
+      }
+      app = {
+        name              = "snet-app"
+        address_prefixes  = ["10.20.2.0/24"]
+        service_endpoints = ["Microsoft.KeyVault"]
+      }
+      data = {
+        name                              = "snet-data"
+        address_prefixes                  = ["10.20.3.0/24"]
+        private_endpoint_network_policies = "Enabled"
+      }
+      postgres = {
+        name             = "snet-postgres"
+        address_prefixes = ["10.20.4.0/24"]
+        delegations = [
+          {
+            name = "pg-delegation"
+            service_delegation = {
+              name    = "Microsoft.DBforPostgreSQL/flexibleServers"
+              actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+            }
+          }
+        ]
+      }
+    }
+    tags = {
+      Topology = "Spoke"
+    }
+  }
+}
+
+# ==============================================================================
+# 4. VIRTUAL NETWORK PEERINGS (Hub ↔ Spoke Interconnect)
+# ==============================================================================
+virtual_network_peerings = {
+  hub_to_spoke = {
+    name                         = "vnet-enterprise-dev-hub-eastus2-to-vnet-enterprise-dev-spoke-eastus2"
+    resource_group_key           = "network"
+    virtual_network_key          = "hub"
+    remote_virtual_network_key   = "spoke"
+    allow_virtual_network_access = true
+    allow_forwarded_traffic      = true
+    allow_gateway_transit        = false
+    use_remote_gateways          = false
+  }
+  spoke_to_hub = {
+    name                         = "vnet-enterprise-dev-spoke-eastus2-to-vnet-enterprise-dev-hub-eastus2"
+    resource_group_key           = "network"
+    virtual_network_key          = "spoke"
+    remote_virtual_network_key   = "hub"
+    allow_virtual_network_access = true
+    allow_forwarded_traffic      = true
+    allow_gateway_transit        = false
+    use_remote_gateways          = false
+  }
+}
+
+# ==============================================================================
+# 5. PUBLIC IP ADDRESSES
+# ==============================================================================
+# Instruction:
+# - Standard SKU aur Static allocation production me recommend kiya jata hai.
+# - Azure Free Trial par maximum 2 Public IPs allowed hoti hain.
+public_ips = {
+  bastion = {
+    name               = "pip-enterprise-dev-bastion-eastus2"
+    resource_group_key = "network"
+    allocation_method  = "Static"
+    sku                = "Standard"
+    zones              = ["1", "2", "3"]
+    tags = {
+      Tier = "Management"
+      Role = "BastionPublicIP"
+    }
+  }
+  appgw = {
+    name               = "pip-enterprise-dev-appgw-eastus2"
+    resource_group_key = "network"
+    allocation_method  = "Static"
+    sku                = "Standard"
+    zones              = ["1", "2", "3"]
+    tags = {
+      Tier = "Networking"
+      Role = "AppGatewayPublicIP"
+    }
+  }
+}
+
+# ==============================================================================
+# 6. NETWORK SECURITY GROUPS (NSG) & FIREWALL RULES
+# ==============================================================================
+# Instruction:
+# - NSG rules me priority (100 - 4096) unique honi chahiye.
+# - Direction: "Inbound" ya "Outbound".
+# - Access: "Allow" ya "Deny".
+# - Protocol: "Tcp", "Udp", "Icmp", ya "*".
+# - subnet_associations me `vnet_key` aur `subnet_key` dekar NSG ko VNet subnets
+#   se bind kiya jata hai.
+network_security_groups = {
+  web = {
+    name               = "nsg-enterprise-dev-web-eastus2"
+    resource_group_key = "network"
+    security_rules = {
+      allow_https = {
+        priority                   = 100
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_port_range          = "*"
+        destination_port_range     = "443"
+        source_address_prefix      = "Internet"
+        destination_address_prefix = "VirtualNetwork"
+        description                = "Allow HTTPS inbound from Internet"
+      }
+      allow_http = {
+        priority                   = 110
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_port_range          = "*"
+        destination_port_range     = "80"
+        source_address_prefix      = "Internet"
+        destination_address_prefix = "VirtualNetwork"
+        description                = "Allow HTTP inbound from Internet"
+      }
+    }
+    subnet_associations = {
+      web_subnet = {
+        vnet_key   = "spoke"
+        subnet_key = "web"
+      }
+    }
+    tags = {
+      Tier = "Networking"
+    }
+  }
+  mgmt = {
+    name               = "nsg-enterprise-dev-mgmt-eastus2"
+    resource_group_key = "network"
+    security_rules = {
+      allow_ssh = {
+        priority                   = 100
+        direction                  = "Inbound"
+        access                     = "Allow"
+        protocol                   = "Tcp"
+        source_port_range          = "*"
+        destination_port_range     = "22"
+        source_address_prefix      = "10.0.0.0/8" # Only internal enterprise traffic
+        destination_address_prefix = "VirtualNetwork"
+        description                = "Allow internal SSH management"
+      }
+    }
+    subnet_associations = {
+      mgmt_subnet = {
+        vnet_key   = "hub"
+        subnet_key = "management"
+      }
+    }
+  }
+}
+
+# ==============================================================================
+# 7. ROUTE TABLES (User Defined Routes / UDR)
+# ==============================================================================
+# Instruction:
+# - Next Hop Types: "VirtualAppliance" (e.g. Firewall NVA IP), "VnetLocal",
+#   "Internet", "None".
+# - bgp_route_propagation_enabled: true (expressroute/vpn ke liye) ya false.
+# - subnet_associations ke through route table ko specific subnets par attach karein.
+route_tables = {
+  spoke_udr = {
+    name                          = "rt-enterprise-dev-spoke-eastus2"
+    resource_group_key            = "network"
+    bgp_route_propagation_enabled = true
+    routes = {
+      internal_traffic = {
+        address_prefix = "10.10.0.0/16"
+        next_hop_type  = "VnetLocal"
+      }
+    }
+    subnet_associations = {
+      app = {
+        vnet_key   = "spoke"
+        subnet_key = "app"
+      }
+    }
+    tags = {
+      Tier = "Networking"
+    }
+  }
+}
+
+# ==============================================================================
+# 8. STORAGE ACCOUNTS & BLOB / FILE CONTAINER SERVICES
+# ==============================================================================
+# Instruction:
+# - name: Globally unique, lowercase alphanumeric only, 3 to 24 characters.
+# - account_tier: "Standard" ya "Premium".
+# - account_replication_type: "LRS" (Dev), "GRS" (Prod geo-redundant), "ZRS" (Zone).
+# - min_tls_version: Always enforce "TLS1_2" for enterprise security compliance.
+# - blob_containers me container_access_type: "private" (recommended) ya "blob".
+storage_accounts = {
+  data_store = {
+    name                            = "stentdevdata001" # Must be globally unique, lowercase alphanumeric (3-24 chars)
+    resource_group_key              = "data"
+    account_tier                    = "Standard"
+    account_replication_type        = "LRS" # Options: LRS, GRS, ZRS, GZRS
+    account_kind                    = "StorageV2"
+    min_tls_version                 = "TLS1_2"
+    allow_nested_items_to_be_public = false
+    shared_access_key_enabled       = true
+    blob_containers = {
+      appdata = {
+        container_access_type = "private"
+      }
+      backups = {
+        container_access_type = "private"
+      }
+    }
+    file_shares = {
+      config = {
+        quota_in_gb = 50
+      }
+    }
+    tags = {
+      Tier = "DataStorage"
+    }
+  }
+}
+
+# ==============================================================================
+# 9. KEY VAULTS & SECRETS
+# ==============================================================================
+# Instruction:
+# - enable_rbac_authorization = true recommend kiya jata hai modern Azure RBAC ke liye.
+key_vaults = {
+  app_vault = {
+    name                            = "kv-ent-dev-app-eastus2" # Globally unique (3-24 chars)
+    resource_group_key              = "app"
+    sku_name                        = "standard"
+    soft_delete_retention_days      = 7
+    purge_protection_enabled        = false # dev me false, prod me true
+    public_network_access_enabled   = true
+    enable_rbac_authorization       = true
+    enabled_for_deployment          = false
+    enabled_for_disk_encryption     = false
+    enabled_for_template_deployment = false
+    tags = {
+      Tier = "Security"
+    }
+  }
+}
+
+key_vault_secrets = {
+  app_secrets = {
+    key_vault_key = "app_vault"
+    secrets = {
+      "app-api-token" = { # Hyphens and alphanumeric only (no underscores)
+        value = "placeholder-token-value"
+      }
+    }
+  }
+}
+
+# ==============================================================================
+# 10. AZURE BASTION HOST
+# ==============================================================================
+# Instruction:
+# - Bastion subnet ka naam hamesha "AzureBastionSubnet" hona chahiye (/26 minimum).
+# - sku: "Standard" (supports tunneling, shareable links, file copy) ya "Basic".
+# - scale_units: 2 to 50 (Standard SKU only).
+bastion_hosts = {
+  primary = {
+    name               = "bas-enterprise-dev-eastus2"
+    resource_group_key = "network"
+    vnet_key           = "hub"
+    subnet_key         = "bastion"
+    public_ip_key      = "bastion"
+    sku                = "Standard"
+    scale_units        = 2
+    copy_paste_enabled = true
+    file_copy_enabled  = true
+    ip_connect_enabled = true
+    tunneling_enabled  = true
+    tags = {
+      Tier = "Management"
+      Role = "BastionHost"
+    }
+  }
+}
+
+# ==============================================================================
+# 11. APPLICATION GATEWAY (v2 with WAF / SSL Offloading)
+# ==============================================================================
+# Instruction:
+# - Application Gateway dedicated subnet me deploy hota hai (min /24 prefix).
+# - sku_name: "Standard_v2" ya "WAF_v2" (web application firewall).
+# - frontend_port_http / https, backend_address_pools, listeners, aur routing rules
+#   ko ek doosre se map karein.
+application_gateways = {
+  primary = {
+    name               = "agw-enterprise-dev-eastus2"
+    resource_group_key = "network"
+    vnet_key           = "hub"
+    subnet_key         = "appgw"
+    public_ip_key      = "appgw"
+    sku_name           = "Standard_v2"
+    sku_tier           = "Standard_v2"
+    capacity           = 1
+    frontend_port_http = 80
+    backend_address_pools = {
+      primary_pool = {
+        name = "bap-app-service"
+      }
+    }
+    http_settings = {
+      primary_settings = {
+        name                  = "bhs-http-80"
+        cookie_based_affinity = "Disabled"
+        port                  = 80
+        protocol              = "Http"
+        request_timeout       = 30
+      }
+    }
+    http_listeners = {
+      primary_listener = {
+        name          = "hl-http"
+        frontend_port = 80
+        protocol      = "Http"
+      }
+    }
+    request_routing_rules = {
+      primary_rule = {
+        name                       = "rrr-default"
+        rule_type                  = "Basic"
+        http_listener_name         = "hl-http"
+        backend_address_pool_name  = "bap-app-service"
+        backend_http_settings_name = "bhs-http-80"
+        priority                   = 100
+      }
+    }
+    tags = {
+      Tier = "Networking"
+      Role = "ApplicationGateway"
+    }
+  }
+}
+
+# ==============================================================================
+# 12. LOAD BALANCERS (Internal / Standard)
+# ==============================================================================
+# Instruction:
+# - Internal Load Balancer private frontend IP use karta hai spoke subnet se.
+# - probes me health probe path ("/healthz") define karein.
+# - lb_rules me frontend aur backend port mapping set karein.
+load_balancers = {
+  internal_app = {
+    name               = "lb-enterprise-dev-internal-eastus2"
+    resource_group_key = "network"
+    sku                = "Standard"
+    frontend_ip_configurations = {
+      internal = {
+        name                          = "fe-internal-app"
+        vnet_key                      = "spoke"
+        subnet_key                    = "app"
+        private_ip_address_allocation = "Dynamic"
+      }
+    }
+    backend_address_pools = {
+      app_backend = {
+        name = "pool-app-backend"
+      }
+    }
+    probes = {
+      http_probe = {
+        name     = "prb-http-8080"
+        protocol = "Http"
+        port     = 8080
+        path     = "/healthz"
+      }
+    }
+    lb_rules = {
+      app_rule = {
+        name                           = "rule-app-traffic"
+        protocol                       = "Tcp"
+        frontend_port                  = 8080
+        backend_port                   = 8080
+        frontend_ip_configuration_name = "fe-internal-app"
+        backend_address_pool_name      = "pool-app-backend"
+        probe_name                     = "prb-http-8080"
+      }
+    }
+    tags = {
+      Tier = "Networking"
+      Role = "InternalLoadBalancer"
+    }
+  }
+}
+
+# ==============================================================================
+# 13. VIRTUAL MACHINES (Linux / Windows Jumpbox)
+# ==============================================================================
+# Instruction:
+# - os_type: "Linux" ya "Windows".
+# - size: Standard VM sizes (e.g. "Standard_B1s", "Standard_D2s_v5").
+# - disable_password_authentication: true (SSH key login only - recommended for security).
+# - source_image_reference: Publisher, offer, sku, version specify karein.
+virtual_machines = {
+  mgmt_jumpbox = {
+    name                          = "vm-enterprise-dev-mgmt-001"
+    resource_group_key            = "network"
+    os_type                       = "Linux"
+    size                          = "Standard_B1s"
+    admin_username                = "azureuser"
+    disable_password_authentication = true
+    admin_ssh_key                 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePublicKeyForDevOpsUserProvisioning"
+    vnet_key                      = "hub"
+    subnet_key                    = "management"
+    private_ip_address_allocation = "Dynamic"
+    source_image_reference = {
+      publisher = "Canonical"
+      offer     = "ubuntu-24_04-lts"
+      sku       = "server"
+      version   = "latest"
+    }
+    os_disk = {
+      name                 = "osdisk-enterprise-dev-mgmt-001"
+      caching              = "ReadWrite"
+      storage_account_type = "Standard_LRS"
+      disk_size_gb         = 30
+    }
+    identity_type = "SystemAssigned"
+    tags = {
+      Tier = "Management"
+      Role = "Jumpbox"
+    }
+  }
+}
+
+# ==============================================================================
+# 14. AZURE KUBERNETES SERVICE (AKS Cluster)
+# ==============================================================================
+# Instruction:
+# - network_plugin: "azure" (Azure CNI) ya "kubenet".
+# - network_policy: "azure" ya "calico" (network policies enforcement ke liye).
+# - sku_tier: "Free" (Dev/test) ya "Standard" (Uptime SLA prod).
+# - default_node_pool: System node pool sizing (vm_size, node_count, auto_scaling).
+aks_clusters = {
+  primary = {
+    name                = "aks-enterprise-dev-eastus2"
+    resource_group_key  = "app"
+    dns_prefix          = "aks-ent-dev"
+    kubernetes_version  = "1.30"
+    sku_tier            = "Free"
+    vnet_key            = "spoke"
+    subnet_key          = "app"
+    network_plugin      = "azure"
+    network_policy      = "azure"
+    default_node_pool = {
+      name                = "system"
+      vm_size             = "Standard_B2s"
+      enable_auto_scaling = false
+      node_count          = 1
+      max_pods            = 30
+      os_disk_size_gb     = 32
+      os_disk_type        = "Managed"
+    }
+    identity_type = "SystemAssigned"
+    tags = {
+      Tier = "Workload"
+      Role = "KubernetesCluster"
+    }
+  }
+}
+
+# ==============================================================================
+# 15. CONTAINER REGISTRIES (Azure ACR)
+# ==============================================================================
+# Instruction:
+# - name: Alphanumeric only, lowercase, 5 to 50 characters.
+# - sku: "Basic" (Dev), "Standard", "Premium" (Content trust & Private endpoints).
+# - admin_enabled: Security best practice ke liye false rakhein; AKS authentication
+#   ke liye Managed Identity (AcrPull) use karein.
+container_registries = {
+  primary = {
+    name                          = "acrmehrwandev01"
+    resource_group_key            = "app"
+    sku                           = "Basic"
+    admin_enabled                 = false
+    public_network_access_enabled = true
+    tags = {
+      Tier = "ContainerRegistry"
+    }
+  }
+}
+
+# ==============================================================================
+# 16. USER ASSIGNED MANAGED IDENTITIES & RBAC
+# ==============================================================================
+# Instruction:
+# - user_assigned_identities: Cloud workloads ke liye passwordless identity.
+# - role_definitions: Custom RBAC roles actions aur not_actions ke sath.
+# - role_assignments: `scope_resource_type` ("container_registry", "resource_group",
+#   "key_vault", etc.) aur `scope_resource_key` dekar auto-scope resolve karta hai.
+user_assigned_identities = {
+  app_workload = {
+    name               = "id-enterprise-dev-app-eastus2"
+    resource_group_key = "app"
+    tags = {
+      Tier = "Security"
+      Role = "WorkloadIdentity"
+    }
+  }
+}
+
+role_definitions = {
+  infra_auditor = {
+    name        = "Enterprise-DevOps-Infra-Auditor"
+    description = "Custom read-only role for platform engineering audits"
+    permissions = [
+      {
+        actions = [
+          "Microsoft.Compute/*/read",
+          "Microsoft.Network/*/read",
+          "Microsoft.Storage/*/read",
+          "Microsoft.KeyVault/*/read",
+          "Microsoft.Insights/*/read"
+        ]
+        not_actions = []
+      }
+    ]
+  }
+}
+
+role_assignments = {
+  app_acr_pull = {
+    scope_resource_type              = "container_registry"
+    scope_resource_key               = "primary"
+    role_definition_name             = "AcrPull"
+    identity_key                     = "app_workload"
+    skip_service_principal_aad_check = true
+    description                      = "Allow workload identity to pull container images from primary ACR"
+  }
+}
+
+# ==============================================================================
+# 17. PRIVATE ENDPOINTS & PRIVATE DNS ZONES
+# ==============================================================================
+# Instruction:
+# - private_dns_zones: Azure PaaS services (e.g. privatelink.postgres.database.azure.com)
+#   ke liye private DNS zone create karta hai aur spoke/hub VNet se link karta hai.
+# - private_endpoints: `target_resource_type` ("storage_account", "key_vault", etc.)
+#   aur `subresource_names` (["blob"], ["vault"], ["sites"]) dekar secure private link banata hai.
+private_dns_zones = {
+  postgres = {
+    name               = "privatelink.postgres.database.azure.com"
+    resource_group_key = "network"
+    virtual_network_links = {
+      spoke = {
+        vnet_key             = "spoke"
+        registration_enabled = false
+      }
+    }
+  }
+}
+
+private_endpoints = {
+  storage_blob = {
+    name                          = "pe-stentdevdata001-blob"
+    resource_group_key            = "data"
+    subnet_vnet_key               = "spoke"
+    subnet_key                    = "data"
+    target_resource_type          = "storage_account"
+    target_resource_key           = "data_store"
+    subresource_names             = ["blob"]
+    custom_network_interface_name = "nic-pe-stentdevdata001-blob"
+    tags = {
+      Tier = "Networking"
+      Role = "PrivateEndpoint"
+    }
+  }
+}
+
+# ==============================================================================
+# 18. AZURE MONITOR, ACTION GROUPS & ALERT RULES
+# ==============================================================================
+# Instruction:
+# - log_analytics_workspaces: Central observability hub for logs and metrics.
+# - monitor_action_groups: Incident alert receivers (email, SMS, webhook, push).
+# - monitor_metric_alerts: Automated threshold alerts (e.g. CPU > 85%, memory pressure).
+# - monitor_diagnostic_settings: PaaS services ke resource logs aur metrics ko
+#   Log Analytics me stream karta hai.
+log_analytics_workspaces = {
+  central = {
+    name               = "log-enterprise-dev-eastus2"
+    resource_group_key = "app"
+    sku                = "PerGB2018"
+    retention_in_days  = 30
+    tags = {
+      Tier = "Observability"
+    }
+  }
+}
+
+monitor_action_groups = {
+  devops = {
+    name               = "ag-enterprise-devops-dev"
+    resource_group_key = "app"
+    short_name         = "devops-alert"
+    email_receivers = [
+      {
+        name          = "lead-admin"
+        email_address = "admin@example.com"
+      }
+    ]
+  }
+}
+
+monitor_metric_alerts = {
+  vm_high_cpu = {
+    name                = "alert-vm-jumpbox-high-cpu"
+    resource_group_key  = "network"
+    target_resource_type = "virtual_machine"
+    target_resource_key  = "mgmt_jumpbox"
+    action_group_key    = "devops"
+    severity            = 2
+    window_size         = "PT5M"
+    frequency           = "PT1M"
+    criterion = {
+      metric_namespace = "Microsoft.Compute/virtualMachines"
+      metric_name      = "Percentage CPU"
+      aggregation      = "Average"
+      operator         = "GreaterThan"
+      threshold        = 85
+    }
+  }
+}
+
+monitor_diagnostic_settings = {
+  kv_diag = {
+    name                       = "diag-kv-app"
+    target_resource_type       = "key_vault"
+    target_resource_key        = "app_vault"
+    log_analytics_workspace_key = "central"
+    metric_categories          = ["AllMetrics"]
+  }
+}
+
+monitor_workspaces = {
+  primary = {
+    name                          = "amw-enterprise-dev-eastus2"
+    resource_group_key            = "app"
+    public_network_access_enabled = true
+    prometheus_rule_groups = {
+      cluster_health = {
+        name         = "amw-enterprise-dev-cluster-health"
+        description  = "Node and pod Prometheus alerting rules"
+        cluster_name = "aks-enterprise-dev-eastus2"
+        interval     = "PT1M"
+        rules = [
+          {
+            alert      = "NodeDiskPressure"
+            expression = "node_disk_usage_percentage > 85"
+            severity   = 2
+            for        = "PT5M"
+            labels = {
+              severity = "warning"
+            }
+          }
+        ]
+      }
+    }
+  }
+}
+
+# ==============================================================================
+# 19. RECOVERY SERVICES VAULT & VM BACKUPS
+# ==============================================================================
+# Instruction:
+# - recovery_services_vaults: Central backup vault for VMs and SQL databases.
+# - vm_backup_policies: Scheduled backup frequency ("Daily", "Weekly"), retention time,
+#   aur daily backup counts. Policy name must contain only hyphens and alphanumeric characters.
+recovery_services_vaults = {
+  app_vault = {
+    name                = "rsv-enterprise-dev-eastus2"
+    resource_group_key  = "app"
+    sku                 = "Standard"
+    storage_mode_type   = "LocallyRedundant"
+    soft_delete_enabled = true
+    vm_backup_policies = {
+      daily_policy = {
+        name                  = "daily-vm-backup" # Hyphens and alphanumeric only
+        frequency             = "Daily"
+        time                  = "23:00"
+        retention_daily_count = 14
+      }
+    }
+    tags = {
+      Tier = "Management"
+      Role = "BackupVault"
+    }
+  }
+}
+
+# ==============================================================================
+# 20. SERVICE BUS & EVENT GRID TOPICS
+# ==============================================================================
+# Instruction:
+# - servicebus_namespaces: Enterprise integration messaging (Queues for FIFO/pub-sub).
+# - event_grid_topics: Event-driven reactive architecture for serverless apps.
+servicebus_namespaces = {
+  primary_bus = {
+    name               = "sb-enterprise-dev-mehrwan01" # Unique namespace name
+    resource_group_key = "app"
+    sku                = "Standard"
+    queues = {
+      task_queue = {
+        max_size_in_megabytes = 1024
+      }
+    }
+    tags = {
+      Tier = "Integration"
+      Role = "ServiceBus"
+    }
+  }
+}
+
+event_grid_topics = {
+  platform_events = {
+    name               = "evgt-enterprise-dev-eastus2"
+    resource_group_key = "app"
+    tags = {
+      Tier = "Integration"
+    }
+  }
+}
+
+# ==============================================================================
+# 21. FINOPS BUDGETS & GOVERNANCE POLICY
+# ==============================================================================
+# Instruction:
+# - consumption_budgets: FinOps cost governance. Threshold (e.g. 80%) breach hone
+#   par alert email trigger hota hai.
+# - policy_assignments: Azure Governance as Code. Resource groups par mandatory tags,
+#   allowed locations, ya security compliance audit/enforce karta hai.
+consumption_budgets = {
+  app_monthly = {
+    name               = "budget-app-monthly"
+    scope_type         = "resource_group"
+    resource_group_key = "app"
+    amount             = 500 # Currency amount in USD
+    time_grain         = "Monthly"
+    time_period = {
+      start_date = "2026-10-01T00:00:00Z"
+    }
+    notifications = {
+      warn_80 = {
+        operator       = "GreaterThan"
+        threshold      = 80
+        threshold_type = "Actual"
+        contact_emails = ["finops-alerts@enterprise.com"]
+      }
+    }
+  }
+}
+
+policy_assignments = {
+  rg_tag_governance = {
+    name                 = "pol-require-env-tag"
+    display_name         = "Require Environment Tag on Resource Groups"
+    scope_type           = "resource_group"
+    resource_group_key   = "app"
+    policy_definition_id = "/providers/Microsoft.Authorization/policyDefinitions/96670d01-0a4d-4649-9c89-2d3abc0a5025"
+    parameters           = "{\"tagName\":{\"value\":\"Environment\"}}"
+    enforce              = true
+  }
+}
+
+# ==============================================================================
+# 22. OPTIONAL ADVANCED PLATFORM RESOURCES (DEMO VALUES & GUIDELINES)
+# ==============================================================================
+# Instruction:
+# - Ye enterprise platform features hain jo aap apni architecture ke hisab se
+#   activate kar sakte hain.
+# - Har block me demo values aur configuration guidelines provide ki gayi hain.
+# - Agar kisi module ki zaroorat na ho to simply us map ko `= {}` kar dein.
+
+# ------------------------------------------------------------------------------
+# 22.1 Management Groups (Cloud Adoption Framework / CAF Hierarchy)
+# ------------------------------------------------------------------------------
+management_groups = {
+  landing_zones = {
+    name         = "mg-enterprise-landing-zones"
+    display_name = "Enterprise Landing Zones"
+    # Optional parent ID agar kisi existing parent management group ke andar nest karna ho:
+    # parent_management_group_id = "/providers/Microsoft.Management/managementGroups/mg-root"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.2 Azure Policy Definitions (Governance as Code)
+# ------------------------------------------------------------------------------
+# Instruction:
+# - Policy rules ko valid JSON string format me define karein.
+policy_definitions = {
+  mandatory_tags = {
+    name         = "custom-audit-environment-tag"
+    display_name = "Audit Mandatory Environment Tag"
+    policy_type  = "Custom"
+    mode         = "Indexed"
+    policy_rule  = "{\"if\":{\"field\":\"tags['Environment']\",\"exists\":\"false\"},\"then\":{\"effect\":\"audit\"}}"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.3 Azure SQL Server & Databases
+# ------------------------------------------------------------------------------
+mssql_servers = {
+  primary_sql = {
+    name                          = "sql-ent-dev-demo01" # Globally unique across Azure (.database.windows.net)
+    resource_group_key            = "data"
+    administrator_login           = "sqladmin"
+    # Password null rakhne par module automatic 24-character secure random password generate karega:
+    administrator_login_password  = null
+    public_network_access_enabled = false
+    databases = {
+      orders_db = {
+        sku_name    = "Basic" # Options: Basic, S0, S1, GP_Gen5_2, etc.
+        max_size_gb = 2
+      }
+    }
+    tags = {
+      Tier = "Database"
+      Role = "SQLServer"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.4 Azure App Service Plan & Linux Web App
+# ------------------------------------------------------------------------------
+service_plans = {
+  primary = {
+    name               = "asp-enterprise-dev-eastus2"
+    resource_group_key = "app"
+    os_type            = "Linux" # Options: Linux, Windows
+    sku_name           = "B1"    # Options: F1 (Free), B1, P1v3, etc.
+    tags = {
+      Tier = "Application"
+      Role = "AppServicePlan"
+    }
+  }
+}
+
+app_services = {
+  web_api = {
+    name                          = "app-ent-dev-api-demo01" # Globally unique (.azurewebsites.net)
+    resource_group_key            = "app"
+    service_plan_key              = "primary"
+    os_type                       = "Linux"
+    https_only                    = true
+    public_network_access_enabled = true
+    vnet_key                      = "spoke"
+    subnet_key                    = "app"
+    application_stack = {
+      python_version = "3.11" # Options: dotnet, java, node, python
+    }
+    app_settings = {
+      "ENVIRONMENT" = "Development"
+      "PROJECT"     = "EnterprisePlatform"
+      "LOG_LEVEL"   = "Information"
+    }
+    tags = {
+      Tier = "Application"
+      Role = "BackendAPI"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.5 Serverless Function Apps (Azure Functions)
+# ------------------------------------------------------------------------------
+function_apps = {
+  primary = {
+    name                = "func-ent-dev-demo01" # Globally unique (.azurewebsites.net)
+    resource_group_key  = "app"
+    storage_account_key = "data_store"
+    sku_name            = "Y1" # Consumption tier (serverless pay-per-execution)
+    application_stack = {
+      python_version = "3.11"
+    }
+    app_settings = {
+      "FUNCTIONS_WORKER_RUNTIME" = "python"
+      "ENVIRONMENT"              = "Development"
+    }
+    functions = {
+      health_check = {
+        name     = "HealthCheck"
+        language = "Python"
+        config_json = <<-JSON
+        {
+          "bindings": [
+            {
+              "authLevel": "anonymous",
+              "type": "httpTrigger",
+              "direction": "in",
+              "name": "req",
+              "methods": ["get"]
+            },
+            {
+              "type": "http",
+              "direction": "out",
+              "name": "$return"
+            }
+          ]
+        }
+        JSON
+        files = {
+          init = {
+            name    = "__init__.py"
+            content = "import azure.functions as func\n\ndef main(req: func.HttpRequest) -> func.HttpResponse:\n    return func.HttpResponse('Healthy', status_code=200)\n"
+          }
+        }
+      }
+    }
+    tags = {
+      Tier = "Application"
+      Role = "ServerlessFunction"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.6 Azure Firewall & Security Policies
+# ------------------------------------------------------------------------------
+# Instruction:
+# - Azure Firewall provision karne ke liye Hub VNet me 'AzureFirewallSubnet'
+#   aur ek dedicated Public IP required hoti hai.
+azure_firewalls = {
+  primary = {
+    name               = "afw-enterprise-dev-eastus2"
+    resource_group_key = "network"
+    vnet_key           = "hub"
+    subnet_key         = "firewall" # Points to AzureFirewallSubnet
+    sku_name           = "AZFW_VNet"
+    sku_tier           = "Standard" # Options: Basic, Standard, Premium
+    threat_intel_mode  = "Alert"
+    public_ip_key      = "bastion"  # Production me dedicated 'firewall' public_ip use karein
+
+    network_rule_collections = {
+      core_network_rules = {
+        priority = 100
+        action   = "Allow"
+        rules = {
+          allow_dns = {
+            protocols             = ["UDP"]
+            destination_ports     = ["53"]
+            source_addresses      = ["10.0.0.0/8"]
+            destination_addresses = ["*"]
+          }
+          allow_ntp = {
+            protocols             = ["UDP"]
+            destination_ports     = ["123"]
+            source_addresses      = ["10.0.0.0/8"]
+            destination_addresses = ["*"]
+          }
+        }
+      }
+    }
+
+    application_rule_collections = {
+      core_app_rules = {
+        priority = 200
+        action   = "Allow"
+        rules = {
+          allow_updates = {
+            source_addresses  = ["10.0.0.0/8"]
+            destination_fqdns = ["*.microsoft.com", "*.azure.com", "*.ubuntu.com"]
+            protocols = [
+              {
+                port = 443
+                type = "Https"
+              },
+              {
+                port = 80
+                type = "Http"
+              }
+            ]
+          }
+        }
+      }
+    }
+
+    tags = {
+      Tier = "Networking"
+      Role = "SecurityFirewall"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.7 Azure NAT Gateways (Scalable Outbound Egress)
+# ------------------------------------------------------------------------------
+nat_gateways = {
+  spoke_nat = {
+    name               = "nat-enterprise-dev-spoke-eastus2"
+    resource_group_key = "network"
+    public_ip_keys     = ["bastion"] # Production me dedicated 'nat' public_ip key use karein
+    subnet_associations = {
+      app = {
+        vnet_key   = "spoke"
+        subnet_key = "app"
+      }
+    }
+    tags = {
+      Tier = "Networking"
+      Role = "NATGateway"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.8 PostgreSQL Flexible Server (Private VNet Integration)
+# ------------------------------------------------------------------------------
+postgresql_flexible_servers = {
+  primary = {
+    name                = "psql-ent-dev-demo01" # Globally unique lowercase alphanumeric
+    resource_group_key  = "data"
+    server_version      = "16"                  # PostgreSQL version 14, 15, ya 16
+    sku_name            = "B_Standard_B1ms"     # Burstable B1ms tier
+    storage_mb          = 32768
+    auto_grow_enabled   = true
+    administrator_login = "psqladmin"
+
+    # Private network integration:
+    vnet_key             = "spoke"
+    subnet_key           = "postgres"
+    private_dns_zone_key = "postgres"
+
+    databases = {
+      appdb = {
+        name      = "appdb"
+        charset   = "UTF8"
+        collation = "en_US.utf8"
+      }
+    }
+
+    server_configurations = {
+      "client_min_messages" = "notice"
+      "azure.extensions"    = "pg_stat_statements"
+    }
+
+    tags = {
+      Tier = "Database"
+      Role = "PostgreSQL"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.9 Workload Federated Identity Credentials (GitHub Actions / OIDC)
+# ------------------------------------------------------------------------------
+federated_identity_credentials = {
+  github_deploy = {
+    name               = "fed-github-actions-deploy"
+    resource_group_key = "app"
+    identity_key       = "app_workload" # Points to user_assigned_identities["app_workload"]
+    audience           = ["api://AzureADTokenExchange"]
+    issuer             = "https://token.actions.githubusercontent.com"
+    subject            = "repo:my-organization/my-infra-repo:ref:refs/heads/main"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.10 Azure Marketplace Role Assignments
+# ------------------------------------------------------------------------------
+marketplace_role_assignments = {
+  pub_admin = {
+    identity_key         = "app_workload"
+    role_definition_name = "Marketplace Admin"
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.11 Privileged Identity Management (PIM) - Active & Eligible Role Assignments
+# ------------------------------------------------------------------------------
+# Note: PIM features require Microsoft Entra ID P2 license.
+pim_active_role_assignments = {
+  sec_admin_active = {
+    scope_resource_type = "resource_group"
+    scope_resource_key  = "app"
+    role_definition_id  = "/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c" # Built-in Contributor
+    identity_key        = "app_workload"
+    justification       = "Emergency operational maintenance window"
+    schedule = {
+      expiration = {
+        duration_hours = 8
+      }
+    }
+  }
+}
+
+pim_eligible_role_assignments = {
+  sec_admin_eligible = {
+    scope_resource_type = "resource_group"
+    scope_resource_key  = "app"
+    role_definition_id  = "/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c" # Built-in Contributor
+    identity_key        = "app_workload"
+    justification       = "Eligible contributor access for on-call engineers"
+    schedule = {
+      expiration = {
+        duration_days = 180
+      }
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# 22.12 PIM Role Management Policies
+# ------------------------------------------------------------------------------
+role_management_policies = {
+  contributor_policy = {
+    scope_resource_type = "resource_group"
+    scope_resource_key  = "app"
+    role_definition_id  = "/providers/Microsoft.Authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c"
+    activation_rules = {
+      maximum_duration                   = "PT4H"
+      require_approval                   = true
+      require_justification              = true
+      require_multifactor_authentication = true
+    }
+    active_assignment_rules = {
+      expire_after          = "P90D"
+      require_justification = true
+    }
+    eligible_assignment_rules = {
+      expiration_required = false
+    }
+  }
+}
+

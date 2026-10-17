@@ -1,0 +1,165 @@
+# ==============================================================================
+# Stage Template: Code Quality, Linting & Security SAST Scanning
+# Granular Tool Toggles: Gitleaks, TFLint, Trivy, Checkov, terraform fmt, terraform validate
+# ==============================================================================
+
+parameters:
+  - name: stageName
+    type: string
+    default: 'SecurityAndLint'
+  - name: displayName
+    type: string
+    default: 'Security SAST & Quality Checks'
+  - name: workingDirectory
+    type: string
+  - name: terraformVersion
+    type: string
+    default: '1.9.5'
+  - name: vmImageName
+    type: string
+    default: 'ubuntu-latest'
+  - name: enableGitleaks
+    type: boolean
+    default: true
+  - name: enableTflint
+    type: boolean
+    default: true
+  - name: enableCheckov
+    type: boolean
+    default: true
+  - name: enableTrivy
+    type: boolean
+    default: true
+  - name: enableFmtCheck
+    type: boolean
+    default: true
+  - name: enableValidate
+    type: boolean
+    default: true
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    jobs:
+      - job: QualityAndSecurityScan
+        displayName: 'DevSecOps & Linting Suite'
+        pool:
+          vmImage: ${{ parameters.vmImageName }}
+        steps:
+          - checkout: self
+            displayName: 'Checkout Repository'
+
+          # Granular tool installation based on selected options
+          - template: steps-install-tools.yml
+            parameters:
+              terraformVersion: ${{ parameters.terraformVersion }}
+              installGitleaks: ${{ parameters.enableGitleaks }}
+              installTflint: ${{ parameters.enableTflint }}
+              installCheckov: ${{ parameters.enableCheckov }}
+              installTrivy: ${{ parameters.enableTrivy }}
+              installInfracost: false
+
+          # --------------------------------------------------------------------
+          # 1. Gitleaks Secret Detection (Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Gitleaks (Secret & Token Leak Scanner)'
+            condition: and(succeeded(), eq('${{ parameters.enableGitleaks }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -e
+                echo "Scanning workspace for leaked passwords, keys, and tokens..."
+                gitleaks detect --source . --verbose --no-git --redact || {
+                  echo "##vso[task.logissue type=error]Gitleaks detected hardcoded secrets in the code!"
+                  exit 1
+                }
+                echo "Gitleaks Scan Passed: Zero hardcoded secrets detected."
+
+          # --------------------------------------------------------------------
+          # 2. Terraform Code Formatting Check (Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Terraform fmt Check'
+            condition: and(succeeded(), eq('${{ parameters.enableFmtCheck }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              script: |
+                set -e
+                echo "Validating HCL formatting across all modules and environments..."
+                terraform fmt -check -recursive || {
+                  echo "##vso[task.logissue type=error]Terraform files are not properly formatted. Run 'terraform fmt -recursive' locally."
+                  exit 1
+                }
+                echo "Terraform formatting check passed!"
+
+          # --------------------------------------------------------------------
+          # 3. TFLint (Deep Terraform Linter - Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run TFLint (Syntax & Provider Linter)'
+            condition: and(succeeded(), eq('${{ parameters.enableTflint }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              script: |
+                set -e
+                echo "Initializing TFLint plugins..."
+                tflint --init || true
+                echo "Running TFLint across environment..."
+                tflint --format compact --minimum-failure-severity=error
+                echo "TFLint analysis completed successfully!"
+
+          # --------------------------------------------------------------------
+          # 4. Checkov (CIS & Security Compliance Scanner - Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Checkov (Compliance & CIS Benchmark Scan)'
+            condition: and(succeeded(), eq('${{ parameters.enableCheckov }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              script: |
+                echo "Executing Checkov static analysis across Terraform modules..."
+                checkov -d . \
+                  --framework terraform \
+                  --output cli \
+                  --output junitxml \
+                  --output-file-path $(Agent.TempDirectory) \
+                  --soft-fail || true
+                echo "Checkov scan finished."
+
+          # --------------------------------------------------------------------
+          # 5. Trivy (IaC Misconfiguration Scanner - Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Trivy (IaC Misconfiguration Scanner)'
+            condition: and(succeeded(), eq('${{ parameters.enableTrivy }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: $(System.DefaultWorkingDirectory)
+              script: |
+                echo "Scanning for infrastructure misconfigurations with Trivy..."
+                trivy config \
+                  --severity HIGH,CRITICAL \
+                  --exit-code 0 \
+                  .
+                echo "Trivy scan completed."
+
+          # --------------------------------------------------------------------
+          # 6. Terraform Validate (Compilation & Schema Check - Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Terraform Validate'
+            condition: and(succeeded(), eq('${{ parameters.enableValidate }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              script: |
+                set -e
+                echo "Initializing Terraform without backend for local compilation..."
+                terraform init -backend=false
+                echo "Validating Terraform configuration..."
+                terraform validate
+                echo "Terraform validation succeeded!"

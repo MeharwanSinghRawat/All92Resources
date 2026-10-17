@@ -1,0 +1,95 @@
+# ==============================================================================
+# Step Template: Install Terraform & Selected DevSecOps Tools (100% Free / Open-Source)
+# Isolated /tmp Installation Directory: Zero Workspace Pollution
+# ==============================================================================
+
+parameters:
+  - name: terraformVersion
+    type: string
+    default: '1.9.5'
+  - name: installGitleaks
+    type: boolean
+    default: false
+  - name: installTflint
+    type: boolean
+    default: false
+  - name: installCheckov
+    type: boolean
+    default: false
+  - name: installTrivy
+    type: boolean
+    default: false
+  - name: installInfracost
+    type: boolean
+    default: false
+
+steps:
+  - task: TerraformInstaller@1
+    displayName: 'Install Terraform ${{ parameters.terraformVersion }}'
+    inputs:
+      terraformVersion: '${{ parameters.terraformVersion }}'
+
+  - task: Bash@3
+    displayName: 'Install Selected DevSecOps & FinOps Tooling'
+    inputs:
+      targetType: 'inline'
+      script: |
+        set -e
+        echo "=========================================================="
+        echo "  Provisioning Requested DevSecOps & FinOps Tooling       "
+        echo "=========================================================="
+
+        # 1. Fallback check for Terraform in PATH
+        if ! command -v terraform &> /dev/null; then
+          echo "Installing Terraform ${{ parameters.terraformVersion }}..."
+          mkdir -p /tmp/tf_install
+          wget -q https://releases.hashicorp.com/terraform/${{ parameters.terraformVersion }}/terraform_${{ parameters.terraformVersion }}_linux_amd64.zip -O /tmp/tf_install/terraform.zip
+          unzip -q -o /tmp/tf_install/terraform.zip -d /tmp/tf_install
+          sudo mv /tmp/tf_install/terraform /usr/local/bin/
+          rm -rf /tmp/tf_install
+        fi
+        terraform version
+
+        # 2. Install Gitleaks in isolated /tmp directory (Prevents unpacking README.md into workspace)
+        if [ "${{ parameters.installGitleaks }}" = "True" ] || [ "${{ parameters.installGitleaks }}" = "true" ]; then
+          echo "Installing Gitleaks..."
+          GITLEAKS_VERSION="8.18.2"
+          mkdir -p /tmp/gitleaks_install
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz -O /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp/gitleaks_install
+          sudo mv /tmp/gitleaks_install/gitleaks /usr/local/bin/
+          rm -rf /tmp/gitleaks.tar.gz /tmp/gitleaks_install
+          gitleaks version
+        fi
+
+        # 3. Install TFLint in isolated /tmp directory
+        if [ "${{ parameters.installTflint }}" = "True" ] || [ "${{ parameters.installTflint }}" = "true" ]; then
+          echo "Installing TFLint..."
+          mkdir -p /tmp/tflint_install
+          curl -sSL https://github.com/terraform-linters/tflint/releases/latest/download/tflint_linux_amd64.zip -o /tmp/tflint_install/tflint.zip
+          unzip -q -o /tmp/tflint_install/tflint.zip -d /tmp/tflint_install
+          sudo install -c /tmp/tflint_install/tflint /usr/local/bin/
+          rm -rf /tmp/tflint_install
+          tflint --version
+        fi
+
+        # 4. Install Checkov (CIS Benchmarks & Policy as Code)
+        if [ "${{ parameters.installCheckov }}" = "True" ] || [ "${{ parameters.installCheckov }}" = "true" ]; then
+          echo "Installing Checkov..."
+          pip3 install --quiet --upgrade checkov
+          checkov --version
+        fi
+
+        # 5. Install Trivy (IaC Security & Misconfiguration Scanner)
+        if [ "${{ parameters.installTrivy }}" = "True" ] || [ "${{ parameters.installTrivy }}" = "true" ]; then
+          echo "Installing Trivy..."
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          trivy --version
+        fi
+
+        # 6. Install Infracost (Cloud Cost Breakdown)
+        if [ "${{ parameters.installInfracost }}" = "True" ] || [ "${{ parameters.installInfracost }}" = "true" ]; then
+          echo "Installing Infracost..."
+          curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh
+          infracost --version
+        fi

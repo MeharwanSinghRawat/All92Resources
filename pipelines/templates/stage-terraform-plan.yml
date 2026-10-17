@@ -1,0 +1,173 @@
+# ==============================================================================
+# Stage Template: Speculative Execution Plan, Cost Estimation & Reviewer Summary
+# Tools: TerraformTaskV4 (Init & Plan), Infracost (Cost Analysis), Plan Summary Artifact
+# ==============================================================================
+
+parameters:
+  - name: stageName
+    type: string
+    default: 'TerraformPlan'
+  - name: displayName
+    type: string
+    default: 'Terraform Plan & FinOps Infracost'
+  - name: dependsOn
+    type: object
+    default: ['SecurityAndLint']
+  - name: condition
+    type: string
+    default: 'succeeded()'
+  - name: workingDirectory
+    type: string
+  - name: environment
+    type: string
+  - name: azureServiceConnection
+    type: string
+  - name: backendResourceGroup
+    type: string
+  - name: backendStorageAccount
+    type: string
+  - name: backendContainer
+    type: string
+  - name: backendKey
+    type: string
+  - name: terraformVersion
+    type: string
+    default: '1.9.5'
+  - name: vmImageName
+    type: string
+    default: 'ubuntu-latest'
+  - name: enableInfracost
+    type: boolean
+    default: true
+
+stages:
+  - stage: ${{ parameters.stageName }}
+    displayName: ${{ parameters.displayName }}
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: ${{ parameters.condition }}
+    jobs:
+      - job: PlanAndCostEstimation
+        displayName: 'Plan & Cost Analysis (${{ parameters.environment }})'
+        pool:
+          vmImage: ${{ parameters.vmImageName }}
+        steps:
+          - checkout: self
+            displayName: 'Checkout Repository'
+
+          # Tooling installation
+          - template: steps-install-tools.yml
+            parameters:
+              terraformVersion: ${{ parameters.terraformVersion }}
+              installGitleaks: false
+              installTflint: false
+              installCheckov: false
+              installTrivy: false
+              installInfracost: ${{ parameters.enableInfracost }}
+
+          # --------------------------------------------------------------------
+          # 1. Terraform Init (Service Principal Authentication via backendServiceArm)
+          # --------------------------------------------------------------------
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Init (${{ parameters.environment }})'
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              backendServiceArm: ${{ parameters.azureServiceConnection }}
+              backendAzureRmResourceGroupName: ${{ parameters.backendResourceGroup }}
+              backendAzureRmStorageAccountName: ${{ parameters.backendStorageAccount }}
+              backendAzureRmContainerName: ${{ parameters.backendContainer }}
+              backendAzureRmKey: ${{ parameters.backendKey }}
+
+          # --------------------------------------------------------------------
+          # 2. Terraform Plan (Service Principal Authentication via environmentServiceNameAzureRM)
+          # --------------------------------------------------------------------
+          - task: TerraformTaskV4@4
+            displayName: 'Terraform Plan (${{ parameters.environment }})'
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              environmentServiceNameAzureRM: ${{ parameters.azureServiceConnection }}
+              commandOptions: '-out=$(Build.ArtifactStagingDirectory)/tfplan -input=false'
+
+          # --------------------------------------------------------------------
+          # 3. Export Human-Readable Plan Summary
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Export Plan Summary'
+            inputs:
+              targetType: 'inline'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              script: |
+                echo "Generating human-readable plan summary..."
+                terraform show -no-color $(Build.ArtifactStagingDirectory)/tfplan > $(Build.ArtifactStagingDirectory)/plan-summary.txt || true
+                head -n 40 $(Build.ArtifactStagingDirectory)/plan-summary.txt || true
+
+          # --------------------------------------------------------------------
+          # 4. Infracost FinOps Cloud Cost Estimation (Optional)
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Run Infracost (Monthly Cloud Cost Breakdown)'
+            condition: and(succeeded(), eq('${{ parameters.enableInfracost }}', 'true'))
+            inputs:
+              targetType: 'inline'
+              workingDirectory: ${{ parameters.workingDirectory }}
+              script: |
+                echo "Running Infracost cost analysis on Terraform plan..."
+                if [ -n "$INFRACOST_API_KEY" ]; then
+                  infracost breakdown \
+                    --path $(Build.ArtifactStagingDirectory)/tfplan \
+                    --format table \
+                    --out-file $(Build.ArtifactStagingDirectory)/infracost-summary.txt || true
+                  cat $(Build.ArtifactStagingDirectory)/infracost-summary.txt || true
+                else
+                  echo "INFRACOST_API_KEY not configured. Skipping external price lookup."
+                  echo "To enable real-time pricing on PRs, add INFRACOST_API_KEY to Pipeline Variables." > $(Build.ArtifactStagingDirectory)/infracost-summary.txt
+                fi
+
+          # --------------------------------------------------------------------
+          # 5. Publish Plan Artifacts for Reviewers & Downstream Apply
+          # --------------------------------------------------------------------
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Execution Plan (tfplan)'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/tfplan'
+              artifact: 'terraform-plan-${{ parameters.environment }}'
+              publishLocation: 'pipeline'
+
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish Human-Readable Plan & Cost Summary'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/plan-summary.txt'
+              artifact: 'plan-summary-${{ parameters.environment }}'
+              publishLocation: 'pipeline'
+
+          # --------------------------------------------------------------------
+          # 6. Notify Reviewers / Publish Markdown Summary to Pipeline
+          # --------------------------------------------------------------------
+          - task: Bash@3
+            displayName: 'Publish Plan Summary to Pipeline Reviewers'
+            inputs:
+              targetType: 'inline'
+              script: |
+                SUMMARY_FILE="$(Agent.TempDirectory)/review-summary.md"
+                cat << 'EOF' > "$SUMMARY_FILE"
+                # 🚀 Terraform Plan & Reviewer Notification
+
+                ### Target Environment: **${{ parameters.environment }}**
+                - **Pipeline Run:** $(Build.BuildNumber)
+                - **Requested by:** $(Build.RequestedFor)
+                - **Source Branch:** $(Build.SourceBranchName)
+                - **Commit:** $(Build.SourceVersion)
+
+                ---
+
+                ### 📋 Plan Highlights:
+                The execution plan has been generated and validated with Service Principal authentication. Reviewers can inspect the plan artifact attached to this build before approving deployment.
+
+                > **Notice:** Manual approval is required before resources are applied.
+                EOF
+
+                echo "##vso[task.uploadsummary]$SUMMARY_FILE"
+                echo "Reviewer notification posted to Pipeline Run Summary!"
